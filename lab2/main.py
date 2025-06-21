@@ -6,6 +6,8 @@ from plotly.subplots import make_subplots
 import skfuzzy as fuzz
 from skfuzzy import control as ctrl
 from datetime import datetime
+import time
+import threading
 
 # Page configuration
 st.set_page_config(
@@ -14,9 +16,15 @@ st.set_page_config(
     layout="wide"
 )
 
-# Initialize session state for history
+# Initialize session state
 if 'history' not in st.session_state:
     st.session_state.history = []
+if 'simulation_running' not in st.session_state:
+    st.session_state.simulation_running = False
+if 'simulation_data' not in st.session_state:
+    st.session_state.simulation_data = []
+if 'current_sim_temp' not in st.session_state:
+    st.session_state.current_sim_temp = 75.0
 
 def create_fuzzy_system():
     """Create the fuzzy logic control system"""
@@ -52,29 +60,87 @@ def create_fuzzy_system():
     
     return cooling_sim, error, error_dot, cooling
 
-def calculate_error_dot(current_error):
+def simulate_temperature_response(current_temp, target_temp, cooling_output, dt=0.1, room_thermal_mass=0.1):
+    """
+    Simulate how the room temperature changes based on cooling output
+    Args:
+        current_temp: Current room temperature
+        target_temp: Target temperature
+        cooling_output: Fuzzy system cooling output (0-1)
+        dt: Time step
+        room_thermal_mass: Thermal inertia of the room (lower = faster response)
+    """
+    # Environmental heat gain (room naturally warms up)
+    ambient_temp = 80.0  # Ambient temperature
+    heat_gain = (ambient_temp - current_temp) * 0.02  # Natural heat gain
+    
+    # Cooling effect based on fuzzy output
+    cooling_effect = -cooling_output * 5.0  # Max cooling rate of 5°F per time step
+    
+    # Apply thermal mass (slows down temperature changes)
+    temp_change = (heat_gain + cooling_effect) * room_thermal_mass * dt
+    
+    # Update temperature with some smoothing to prevent oscillations
+    new_temp = current_temp + temp_change
+    
+    return new_temp
+
+def calculate_error_dot(current_error, history=None):
     """Calculate error dot (rate of change)"""
-    if len(st.session_state.history) == 0:
+    if history is None:
+        history = st.session_state.history
+        
+    if len(history) == 0:
         return 0.0
     
-    previous_error = st.session_state.history[-1]['error']
+    previous_error = history[-1]['error']
     return previous_error - current_error
 
-def add_reading(target_temp, room_temp):
-    """Add a new temperature reading to history"""
-    error = target_temp - room_temp
-    error_dot = calculate_error_dot(error)
+def run_simulation_step(target_temp, cooling_sim, thermal_mass, dt):
+    """Run one step of the simulation"""
+    current_temp = st.session_state.current_sim_temp
     
-    reading = {
-        'timestamp': datetime.now(),
-        'target_temp': target_temp,
-        'room_temp': room_temp,
-        'error': error,
-        'error_dot': error_dot
+    # Calculate error and error_dot
+    current_error = target_temp - current_temp
+    
+    # Use simulation data for error_dot if available
+    if len(st.session_state.simulation_data) > 0:
+        prev_error = st.session_state.simulation_data[-1]['error']
+        current_error_dot = (prev_error - current_error) / dt
+    else:
+        current_error_dot = 0.0
+    
+    # Get fuzzy system output
+    try:
+        cooling_sim.input['error'] = current_error
+        cooling_sim.input['error_dot'] = current_error_dot
+        cooling_sim.compute()
+        cooling_output = cooling_sim.output['cooling']
+    except:
+        cooling_output = 0.0
+    
+    # Simulate temperature response
+    new_temp = simulate_temperature_response(
+        current_temp, target_temp, cooling_output, dt, thermal_mass
+    )
+    
+    # Update current temperature
+    st.session_state.current_sim_temp = new_temp
+    
+    # Store simulation data
+    sim_data = {
+        'time': len(st.session_state.simulation_data) * dt,
+        'temperature': new_temp,
+        'target': target_temp,
+        'error': current_error,
+        'error_dot': current_error_dot,
+        'cooling_output': cooling_output,
+        'cooling_status': 'ON' if cooling_output > 0.5 else 'OFF'
     }
     
-    st.session_state.history.append(reading)
-    return error, error_dot
+    st.session_state.simulation_data.append(sim_data)
+    
+    return sim_data
 
 def plot_membership_functions(fuzzy_var, current_value, title):
     """Plot membership functions for a fuzzy variable"""
@@ -148,157 +214,362 @@ def plot_output(cooling_var, cooling_output):
     
     return fig
 
+def plot_simulation_results():
+    """Plot the simulation results"""
+    if not st.session_state.simulation_data:
+        return None
+    
+    df = pd.DataFrame(st.session_state.simulation_data)
+    
+    # Create subplots
+    fig = make_subplots(
+        rows=3, cols=1,
+        subplot_titles=('Temperature Response', 'Temperature Error', 'Cooling Output'),
+        vertical_spacing=0.08,
+        shared_xaxes=True
+    )
+    
+    # Temperature plot
+    fig.add_trace(
+        go.Scatter(
+            x=df['time'],
+            y=df['temperature'],
+            name='Room Temperature',
+            line=dict(color='red', width=3),
+            mode='lines'
+        ),
+        row=1, col=1
+    )
+    
+    fig.add_trace(
+        go.Scatter(
+            x=df['time'],
+            y=df['target'],
+            name='Target Temperature',
+            line=dict(color='green', width=2, dash='dash'),
+            mode='lines'
+        ),
+        row=1, col=1
+    )
+    
+    # Error plot
+    fig.add_trace(
+        go.Scatter(
+            x=df['time'],
+            y=df['error'],
+            name='Temperature Error',
+            line=dict(color='blue', width=2),
+            mode='lines',
+            showlegend=False
+        ),
+        row=2, col=1
+    )
+    
+    # Add zero line for error
+    fig.add_hline(y=0, line_dash="dot", line_color="gray", row=2, col=1)
+    
+    # Cooling output plot
+    fig.add_trace(
+        go.Scatter(
+            x=df['time'],
+            y=df['cooling_output'],
+            name='Cooling Output',
+            line=dict(color='purple', width=2),
+            mode='lines',
+            showlegend=False
+        ),
+        row=3, col=1
+    )
+    
+    # Add threshold line for cooling
+    fig.add_hline(y=0.5, line_dash="dot", line_color="gray", row=3, col=1)
+    
+    fig.update_layout(
+        height=800,
+        template="plotly_white",
+        title="Fuzzy Logic AC System Simulation"
+    )
+    
+    fig.update_xaxes(title_text="Time (minutes)", row=3, col=1)
+    fig.update_yaxes(title_text="Temperature (°F)", row=1, col=1)
+    fig.update_yaxes(title_text="Error (°F)", row=2, col=1)
+    fig.update_yaxes(title_text="Cooling Output", row=3, col=1, range=[0, 1.1])
+    
+    return fig
+
 def main():
-    st.title("🌡️ Fuzzy Logic Air Conditioning System")
+    st.title("🌡️ Fuzzy Logic Air Conditioning System with Simulation")
     st.markdown("---")
     
     # Create fuzzy system
     cooling_sim, error_var, error_dot_var, cooling_var = create_fuzzy_system()
     
     # Sidebar controls
-    st.sidebar.header("Temperature Controls")
+    st.sidebar.header("🎛️ Control Panel")
+    
+    # Simulation controls
+    st.sidebar.subheader("Simulation Controls")
     
     target_temp = st.sidebar.slider(
         "Target Temperature (°F)",
         min_value=-100.0,
-        max_value=100.0,
+        max_value=85.0,
         value=72.0,
         step=0.5
     )
     
-    room_temp = st.sidebar.slider(
-        "Current Room Temperature (°F)",
+    initial_temp = st.sidebar.slider(
+        "Initial Room Temperature (°F)",
         min_value=-100.0,
-        max_value=100.0,
+        max_value=85.0,
         value=75.0,
         step=0.5
     )
     
-    if st.sidebar.button("Add Temperature Reading", type="primary"):
-        error, error_dot = add_reading(target_temp, room_temp)
-        st.sidebar.success(f"Reading added! Error: {error:.1f}°F, Rate: {error_dot:.1f}°F/min")
+    # Simulation parameters
+    st.sidebar.subheader("Simulation Parameters")
     
-    # Calculate current values
-    current_error = target_temp - room_temp
-    current_error_dot = calculate_error_dot(current_error)
+    thermal_mass = st.sidebar.slider(
+        "Room Thermal Mass (Response Rate)",
+        min_value=0.01,
+        max_value=0.5,
+        value=0.1,
+        step=0.01,
+        help="Lower values = faster response, Higher values = slower response (prevents ripples)"
+    )
     
-    # Run fuzzy logic simulation
-    try:
-        cooling_sim.input['error'] = current_error
-        cooling_sim.input['error_dot'] = current_error_dot
-        cooling_sim.compute()
-        cooling_output = cooling_sim.output['cooling']
-    except:
-        cooling_output = 0.0
+    sim_speed = st.sidebar.slider(
+        "Simulation Speed",
+        min_value=0.1,
+        max_value=2.0,
+        value=1.0,
+        step=0.1,
+        help="Higher values = faster simulation"
+    )
     
-    # Display current status
-    col1, col2, col3, col4, col5 = st.columns(5)
+    dt = 0.1 / sim_speed  # Time step
+    
+    # Simulation control buttons
+    col1, col2 = st.sidebar.columns(2)
     
     with col1:
-        st.metric("Target Temperature", f"{target_temp:.1f}°F")
+        if st.button("▶️ Start Simulation", type="primary"):
+            st.session_state.simulation_running = True
+            st.session_state.simulation_data = []
+            st.session_state.current_sim_temp = initial_temp
     
     with col2:
-        st.metric("Room Temperature", f"{room_temp:.1f}°F")
+        if st.button("⏹️ Stop Simulation"):
+            st.session_state.simulation_running = False
     
-    with col3:
-        delta_color = "inverse" if current_error > 0 else "normal"
-        st.metric("Temperature Error", f"{current_error:.1f}°F", delta=f"{current_error:.1f}°F")
-
-    with col4:
-        st.metric("Error Rate", f"{current_error_dot:.1f}°F/min")
+    if st.sidebar.button("🔄 Reset Simulation"):
+        st.session_state.simulation_running = False
+        st.session_state.simulation_data = []
+        st.session_state.current_sim_temp = initial_temp
+        st.rerun()
     
-    with col5:
-        cooling_status = "ON" if cooling_output > 0.5 else "OFF"
-        st.metric("Cooling Status", cooling_status, f"{cooling_output:.1%}")
+    # Manual controls
+    st.sidebar.subheader("Manual Controls")
     
-    st.markdown("---")
+    manual_target = st.sidebar.slider(
+        "Manual Target Temperature (°F)",
+        min_value=60.0,
+        max_value=85.0,
+        value=72.0,
+        step=0.5,
+        key="manual_target"
+    )
     
-    # Create visualization tabs
-    tab1, tab2, tab3 = st.tabs(["📊 Membership Functions", "🎛️ System Output", "📈 History"])
+    manual_room = st.sidebar.slider(
+        "Manual Room Temperature (°F)",
+        min_value=60.0,
+        max_value=85.0,
+        value=75.0,
+        step=0.5,
+        key="manual_room"
+    )
     
-    with tab1:
-        col1, col2 = st.columns(2)
+    if st.sidebar.button("Add Manual Reading"):
+        error = manual_target - manual_room
+        error_dot = calculate_error_dot(error)
+        
+        reading = {
+            'timestamp': datetime.now(),
+            'target_temp': manual_target,
+            'room_temp': manual_room,
+            'error': error,
+            'error_dot': error_dot
+        }
+        
+        st.session_state.history.append(reading)
+        st.sidebar.success("Manual reading added!")
+    
+    # Main content area
+    # Create placeholder for simulation
+    sim_placeholder = st.empty()
+    
+    # Run simulation if active
+    if st.session_state.simulation_running:
+        with sim_placeholder.container():
+            # Current simulation status
+            if st.session_state.simulation_data:
+                latest_data = st.session_state.simulation_data[-1]
+                
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric("Current Temperature", f"{latest_data['temperature']:.1f}°F")
+                
+                with col2:
+                    st.metric("Target Temperature", f"{latest_data['target']:.1f}°F")
+                
+                with col3:
+                    st.metric("Temperature Error", f"{latest_data['error']:.1f}°F")
+                
+                with col4:
+                    cooling_status = latest_data['cooling_status']
+                    st.metric("Cooling Status", cooling_status, f"{latest_data['cooling_output']:.1%}")
+                
+                # Real-time plot
+                fig = plot_simulation_results()
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Progress indicator
+                if abs(latest_data['error']) < 0.5:
+                    st.success("🎯 Target temperature reached!")
+                elif abs(latest_data['error']) < 2.0:
+                    st.warning("🔄 Approaching target temperature...")
+                else:
+                    st.info("🌡️ System is actively working to reach target temperature...")
+            
+            # Run simulation step
+            if len(st.session_state.simulation_data) < 500:  # Limit simulation length
+                sim_data = run_simulation_step(target_temp, cooling_sim, thermal_mass, dt)
+                time.sleep(0.1)  # Small delay for animation effect
+                st.rerun()
+            else:
+                st.session_state.simulation_running = False
+                st.success("Simulation completed!")
+    
+    else:
+        # Static analysis mode
+        current_error = manual_target - manual_room
+        current_error_dot = calculate_error_dot(current_error)
+        
+        # Run fuzzy logic simulation
+        try:
+            cooling_sim.input['error'] = current_error
+            cooling_sim.input['error_dot'] = current_error_dot
+            cooling_sim.compute()
+            cooling_output = cooling_sim.output['cooling']
+        except:
+            cooling_output = 0.0
+        
+        # Display current status
+        col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            error_fig = plot_membership_functions(
-                error_var, current_error, 
-                "Temperature Error Membership Functions"
-            )
-            st.plotly_chart(error_fig, use_container_width=True)
+            st.metric("Target Temperature", f"{manual_target:.1f}°F")
         
         with col2:
-            error_dot_fig = plot_membership_functions(
-                error_dot_var, current_error_dot,
-                "Error Rate Membership Functions"
-            )
-            st.plotly_chart(error_dot_fig, use_container_width=True)
-    
-    with tab2:
-        output_fig = plot_output(cooling_var, cooling_output)
-        st.plotly_chart(output_fig, use_container_width=True)
+            st.metric("Room Temperature", f"{manual_room:.1f}°F")
         
-        # System interpretation
-        st.subheader("System Interpretation")
-        if cooling_output > 0.7:
-            st.success("🔴 **Cooling System: ON** - Room is too warm, actively cooling")
-        elif cooling_output < 0.3:
-            st.info("🔵 **Cooling System: OFF** - Temperature is acceptable or room is too cold")
-        else:
-            st.warning("🟡 **Cooling System: MODERATE** - Partial cooling needed")
-    
-    with tab3:
-        if st.session_state.history:
-            # Convert history to DataFrame
-            df = pd.DataFrame(st.session_state.history)
-            df['time'] = df['timestamp'].dt.strftime('%H:%M:%S')
+        with col3:
+            st.metric("Temperature Error", f"{current_error:.1f}°F")
+        
+        with col4:
+            cooling_status = "ON" if cooling_output > 0.5 else "OFF"
+            st.metric("Cooling Status", cooling_status, f"{cooling_output:.1%}")
+        
+        st.markdown("---")
+        
+        # Create visualization tabs
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Membership Functions", "🎛️ System Output", "📈 History", "🔬 Simulation Results"])
+        
+        with tab1:
+            col1, col2 = st.columns(2)
             
-            # Display table
-            st.subheader("Temperature History")
-            display_df = df[['time', 'target_temp', 'room_temp', 'error', 'error_dot']].copy()
-            display_df.columns = ['Time', 'Target (°F)', 'Room (°F)', 'Error (°F)', 'Rate (°F/min)']
-            st.dataframe(display_df, use_container_width=True)
+            with col1:
+                error_fig = plot_membership_functions(
+                    error_var, current_error, 
+                    "Temperature Error Membership Functions"
+                )
+                st.plotly_chart(error_fig, use_container_width=True)
             
-            # Plot history
-            if len(df) > 1:
-                fig = make_subplots(
-                    rows=2, cols=1,
-                    subplot_titles=('Temperature History', 'Error History'),
-                    vertical_spacing=0.1
+            with col2:
+                error_dot_fig = plot_membership_functions(
+                    error_dot_var, current_error_dot,
+                    "Error Rate Membership Functions"
                 )
-                
-                # Temperature plot
-                fig.add_trace(
-                    go.Scatter(x=df.index, y=df['target_temp'], name='Target', line=dict(color='green')),
-                    row=1, col=1
-                )
-                fig.add_trace(
-                    go.Scatter(x=df.index, y=df['room_temp'], name='Room', line=dict(color='red')),
-                    row=1, col=1
-                )
-                
-                # Error plot
-                fig.add_trace(
-                    go.Scatter(x=df.index, y=df['error'], name='Error', line=dict(color='blue')),
-                    row=2, col=1
-                )
-                fig.add_trace(
-                    go.Scatter(x=df.index, y=df['error_dot'], name='Error Rate', line=dict(color='orange')),
-                    row=2, col=1
-                )
-                
-                fig.update_layout(height=600, template="plotly_white")
-                fig.update_xaxes(title_text="Reading Number", row=2, col=1)
-                fig.update_yaxes(title_text="Temperature (°F)", row=1, col=1)
-                fig.update_yaxes(title_text="Error/Rate", row=2, col=1)
-                
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(error_dot_fig, use_container_width=True)
+        
+        with tab2:
+            output_fig = plot_output(cooling_var, cooling_output)
+            st.plotly_chart(output_fig, use_container_width=True)
             
-            # Clear history button
-            if st.button("Clear History", type="secondary"):
-                st.session_state.history = []
-                st.rerun()
-        else:
-            st.info("No temperature readings yet. Add some readings using the sidebar controls!")
+            # System interpretation
+            st.subheader("System Interpretation")
+            if cooling_output > 0.7:
+                st.success("🔴 **Cooling System: ON** - Room is too warm, actively cooling")
+            elif cooling_output < 0.3:
+                st.info("🔵 **Cooling System: OFF** - Temperature is acceptable or room is too cold")
+            else:
+                st.warning("🟡 **Cooling System: MODERATE** - Partial cooling needed")
+        
+        with tab3:
+            if st.session_state.history:
+                # Convert history to DataFrame
+                df = pd.DataFrame(st.session_state.history)
+                df['time'] = df['timestamp'].dt.strftime('%H:%M:%S')
+                
+                # Display table
+                st.subheader("Manual Temperature History")
+                display_df = df[['time', 'target_temp', 'room_temp', 'error', 'error_dot']].copy()
+                display_df.columns = ['Time', 'Target (°F)', 'Room (°F)', 'Error (°F)', 'Rate (°F/min)']
+                st.dataframe(display_df, use_container_width=True)
+                
+                # Clear history button
+                if st.button("Clear History"):
+                    st.session_state.history = []
+                    st.rerun()
+            else:
+                st.info("No manual temperature readings yet. Add some readings using the sidebar controls!")
+        
+        with tab4:
+            if st.session_state.simulation_data:
+                st.subheader("Latest Simulation Results")
+                fig = plot_simulation_results()
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Simulation statistics
+                df = pd.DataFrame(st.session_state.simulation_data)
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    settling_time = None
+                    for i, row in df.iterrows():
+                        if abs(row['error']) < 0.5:
+                            settling_time = row['time']
+                            break
+                    
+                    if settling_time:
+                        st.metric("Settling Time", f"{settling_time:.1f} min")
+                    else:
+                        st.metric("Settling Time", "Not reached")
+                
+                with col2:
+                    max_overshoot = df['error'].min() if df['error'].min() < 0 else 0
+                    st.metric("Max Overshoot", f"{abs(max_overshoot):.1f}°F")
+                
+                with col3:
+                    steady_state_error = df['error'].iloc[-1] if len(df) > 0 else 0
+                    st.metric("Steady State Error", f"{steady_state_error:.1f}°F")
+                
+            else:
+                st.info("No simulation data available. Run a simulation to see results!")
 
 if __name__ == "__main__":
     main()
